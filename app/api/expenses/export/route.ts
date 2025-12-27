@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server"
 import { prisma } from "@/lib/prisma"
 import { requireMembership } from "@/lib/auth-helpers"
+import { getLedgerExpensesForExport } from "@/lib/reports/ledgerReports"
+
+const LEDGER_REPORTS_ENABLED = process.env.LEDGER_REPORTS_ENABLED === "true"
 
 export async function GET(request: NextRequest) {
   try {
@@ -17,32 +20,61 @@ export async function GET(request: NextRequest) {
 
     await requireMembership(organizationId, "VIEWER")
 
-    const where: any = {
-      organizationId,
-    }
+    let expenses: Array<{
+      date: Date
+      amount: number
+      description: string
+      category: string
+      vendor: string
+    }>
 
-    if (startDate) {
-      where.date = { ...where.date, gte: new Date(startDate) }
-    }
+    // Use ledger reports if enabled
+    if (LEDGER_REPORTS_ENABLED) {
+      expenses = await getLedgerExpensesForExport({
+        organizationId,
+        startDate: startDate ? new Date(startDate) : undefined,
+        endDate: endDate ? new Date(endDate) : undefined,
+        category: category || undefined,
+        vendor: vendor || undefined,
+      })
+    } else {
+      // Fallback to expense-based export
+      const where: any = {
+        organizationId,
+        deletedAt: null, // Exclude soft-deleted expenses
+      }
 
-    if (endDate) {
-      where.date = { ...where.date, lte: new Date(endDate) }
-    }
+      if (startDate) {
+        where.date = { ...where.date, gte: new Date(startDate) }
+      }
 
-    if (category) {
-      where.category = category
-    }
+      if (endDate) {
+        where.date = { ...where.date, lte: new Date(endDate) }
+      }
 
-    if (vendor) {
-      where.vendor = vendor
-    }
+      if (category) {
+        where.category = category
+      }
 
-    const expenses = await prisma.expense.findMany({
-      where,
-      orderBy: {
-        date: "desc",
-      },
-    })
+      if (vendor) {
+        where.vendor = vendor
+      }
+
+      const expenseRecords = await prisma.expense.findMany({
+        where,
+        orderBy: {
+          date: "desc",
+        },
+      })
+
+      expenses = expenseRecords.map((expense) => ({
+        date: expense.date,
+        amount: Number(expense.amount),
+        description: expense.description,
+        category: expense.category || "",
+        vendor: expense.vendor || "",
+      }))
+    }
 
     // Generate CSV
     const headers = ["Date", "Amount", "Description", "Category", "Vendor"]

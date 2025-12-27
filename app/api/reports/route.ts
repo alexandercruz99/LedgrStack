@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from "next/server"
 import { prisma } from "@/lib/prisma"
 import { requireMembership } from "@/lib/auth-helpers"
 import { reportFiltersSchema } from "@/lib/validations"
+import { getLedgerReport } from "@/lib/reports/ledgerReports"
+
+const LEDGER_REPORTS_ENABLED = process.env.LEDGER_REPORTS_ENABLED === "true"
 
 export async function GET(request: NextRequest) {
   try {
@@ -18,8 +21,23 @@ export async function GET(request: NextRequest) {
     const validated = reportFiltersSchema.parse(filters)
     await requireMembership(validated.organizationId, "VIEWER")
 
+    // Use ledger reports if enabled
+    if (LEDGER_REPORTS_ENABLED) {
+      const result = await getLedgerReport({
+        organizationId: validated.organizationId,
+        startDate: validated.startDate,
+        endDate: validated.endDate,
+        category: validated.category,
+        vendor: validated.vendor,
+        groupBy: validated.groupBy,
+      })
+      return NextResponse.json(result)
+    }
+
+    // Fallback to expense-based reports
     const where: any = {
       organizationId: validated.organizationId,
+      deletedAt: null, // Exclude soft-deleted expenses
     }
 
     if (validated.startDate) {

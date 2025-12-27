@@ -1,13 +1,14 @@
 # Ledgr
 
-A production-ready multi-tenant expense tracking application built with Next.js 14, TypeScript, Prisma, and PostgreSQL.
+A production-ready multi-tenant expense tracking application built with Next.js 14, TypeScript, Prisma, and PostgreSQL. Ledgr provides an expense-first user experience backed by a double-entry ledger system for accurate financial reporting and audit trails.
 
 ## Features
 
 - **Multi-tenant Architecture** - Complete organization isolation with role-based access control (OWNER/ADMIN/MEMBER/VIEWER)
 - **Expense Management** - Full CRUD operations for expenses with categories, vendors, and dates
+- **Double-Entry Ledger** - Every expense creates ledger transactions with balanced DR/CR postings
 - **Receipt Attachments** - Upload and manage receipt files using S3 presigned URLs
-- **Reports & Analytics** - View expense totals grouped by month, category, or vendor
+- **Reports & Analytics** - View expense totals grouped by month, category, or vendor (ledger-derived)
 - **CSV Export** - Export filtered expense data to CSV
 - **Audit Logging** - Track key actions across the application
 - **Input Validation** - Zod schema validation on all server inputs
@@ -101,6 +102,9 @@ npm run db:migrate
 
 # Seed the database with demo data
 npm run db:seed
+
+# Backfill existing expenses into ledger (if you have existing data)
+npm run db:backfill-ledger
 ```
 
 ### 5. Run the development server
@@ -129,6 +133,8 @@ Or sign in with Google if you've configured OAuth credentials.
 - `npm run db:migrate` - Run database migrations
 - `npm run db:seed` - Seed database with demo data
 - `npm run db:studio` - Open Prisma Studio
+- `npm run db:backfill-ledger` - Backfill existing expenses into ledger tables
+- `npm run test:ledger` - Run ledger self-test to verify ledger functionality
 
 ## Project Structure
 
@@ -171,9 +177,55 @@ The application uses the following main models:
 - **User** - Application users
 - **Organization** - Multi-tenant organizations
 - **Membership** - User-organization relationships with roles
-- **Expense** - Expense records
+- **Expense** - Expense records (linked to ledger transactions)
 - **Receipt** - Receipt attachments (linked to expenses)
 - **AuditLog** - Audit trail of actions
+
+### Ledger Models
+
+- **LedgerAccount** - Chart of accounts (ASSET, LIABILITY, EQUITY, INCOME, EXPENSE)
+- **LedgerTransaction** - Double-entry transactions with idempotency keys
+- **LedgerPosting** - Individual DR/CR postings that make up transactions
+- **LedgerAttachmentLink** - Links receipts to ledger transactions
+- **LedgerPeriodLock** - Locks accounting periods to prevent modifications
+
+## Ledger System
+
+Ledgr uses a double-entry ledger system where every expense operation creates balanced ledger transactions:
+
+- **Expense Create:** Creates a ledger transaction with DR (expense account) and CR (cash account) postings
+- **Expense Update:** Reverses the original transaction and creates a new one with updated values (supersede pattern)
+- **Expense Delete:** Reverses the transaction and soft-deletes the expense (no hard deletes in ledger)
+- **Append-Only:** Ledger tables are append-only; corrections are made via reversals, not edits
+- **Idempotency:** All ledger transactions use idempotency keys to prevent duplicates
+- **Period Locking:** Accounting periods can be locked to prevent modifications
+
+### Reports
+
+Reports can be generated from either expense records (legacy) or ledger transactions (recommended). Enable ledger-derived reports by setting:
+
+```env
+LEDGER_REPORTS_ENABLED=true
+```
+
+Ledger-derived reports provide:
+- Deterministic results based on transaction history
+- Automatic exclusion of reversed transactions
+- Accurate totals that match the ledger balance
+
+### Backfilling Existing Data
+
+If you have existing expenses before enabling the ledger system, run:
+
+```bash
+npm run db:backfill-ledger
+```
+
+This script:
+- Creates default accounts (Cash, Uncategorized Expense) for each organization
+- Creates ledger transactions for all existing expenses
+- Links receipts to ledger transactions
+- Uses deterministic idempotency keys (`backfill:expense:${expenseId}`) so it's safe to rerun
 
 ## Security Features
 
@@ -182,6 +234,7 @@ The application uses the following main models:
 - **Input Validation:** All API inputs validated with Zod schemas
 - **Authorization Checks:** Server-side authorization on all routes
 - **IDOR Prevention:** Requests always include organizationId and membership is verified
+- **Period Locking:** Prevents modifications to locked accounting periods
 
 ## Contributing
 

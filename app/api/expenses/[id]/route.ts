@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma"
 import { requireMembership, canManageExpenses } from "@/lib/auth-helpers"
 import { expenseUpdateSchema } from "@/lib/validations"
 import { createAuditLog } from "@/lib/audit-log"
+import { ensureDefaultAccounts, createExpenseTransaction, reverseTransaction, guardPeriodNotLocked } from "@/lib/ledger/ledgerService"
+import { randomUUID } from "crypto"
 
 export async function GET(
   request: NextRequest,
@@ -17,7 +19,7 @@ export async function GET(
       },
     })
 
-    if (!expense) {
+    if (!expense || expense.deletedAt) {
       return NextResponse.json({ error: "Expense not found" }, { status: 404 })
     }
 
@@ -55,12 +57,58 @@ export async function PATCH(
     // Prevent changing organizationId
     const { organizationId, id: _id, ...updateData } = validated
 
-    const expense = await prisma.expense.update({
-      where: { id },
-      data: updateData,
-      include: {
-        receipts: true,
-      },
+    // Guard against locked periods (check both old and new dates)
+    await guardPeriodNotLocked(existingExpense.organizationId, existingExpense.date)
+    if (updateData.date) {
+      await guardPeriodNotLocked(existingExpense.organizationId, updateData.date)
+    }
+
+    // Implement supersede: reverse old transaction, create new one
+    const result = await prisma.$transaction(async (tx) => {
+      // Reverse existing ledger transaction if it exists
+      if (existingExpense.ledgerTransactionId) {
+        await reverseTransaction({
+          organizationId: existingExpense.organizationId,
+          transactionId: existingExpense.ledgerTransactionId,
+          reason: "Expense updated",
+          createdByUserId: user.id,
+        }, tx)
+      }
+
+      // Create new ledger transaction with updated values
+      const finalDate = updateData.date || existingExpense.date
+      const finalAmount = updateData.amount !== undefined ? updateData.amount : existingExpense.amount
+      const finalDescription = updateData.description || existingExpense.description
+      const finalCategory = updateData.category !== undefined ? updateData.category : existingExpense.category
+      const finalVendor = updateData.vendor !== undefined ? updateData.vendor : existingExpense.vendor
+
+      const amountCents = Math.round(Number(finalAmount) * 100)
+      const idempotencyKey = `expense:${id}:${randomUUID()}`
+
+      const newLedgerTransactionId = await createExpenseTransaction({
+        organizationId: existingExpense.organizationId,
+        occurredAt: finalDate,
+        description: finalDescription,
+        amountCents,
+        category: finalCategory,
+        vendor: finalVendor,
+        idempotencyKey,
+        createdByUserId: user.id,
+      }, tx)
+
+      // Update expense with new values and new ledger transaction ID
+      const expense = await tx.expense.update({
+        where: { id },
+        data: {
+          ...updateData,
+          ledgerTransactionId: newLedgerTransactionId,
+        },
+        include: {
+          receipts: true,
+        },
+      })
+
+      return expense
     })
 
     await createAuditLog({
@@ -68,11 +116,11 @@ export async function PATCH(
       userId: user.id,
       action: "UPDATE",
       entityType: "Expense",
-      entityId: expense.id,
+      entityId: result.id,
       metadata: { changes: updateData },
     })
 
-    return NextResponse.json(expense)
+    return NextResponse.json(result)
   } catch (error: any) {
     if (error.name === "ZodError") {
       return NextResponse.json({ error: "Validation error", details: error.errors }, { status: 400 })
@@ -101,16 +149,28 @@ export async function DELETE(
       return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 })
     }
 
-    // Delete receipts from S3
-    const receipts = await prisma.receipt.findMany({
-      where: { expenseId: id },
-    })
+    // Guard against locked periods
+    await guardPeriodNotLocked(expense.organizationId, expense.date)
 
-    // Note: In production, you'd want to delete from S3 here
-    // For now, we'll just delete the database records
+    // Soft delete: reverse transaction, set deletedAt, keep receipts
+    await prisma.$transaction(async (tx) => {
+      // Reverse ledger transaction if it exists
+      if (expense.ledgerTransactionId) {
+        await reverseTransaction({
+          organizationId: expense.organizationId,
+          transactionId: expense.ledgerTransactionId,
+          reason: "Expense deleted",
+          createdByUserId: user.id,
+        })
+      }
 
-    await prisma.expense.delete({
-      where: { id },
+      // Soft delete expense
+      await tx.expense.update({
+        where: { id },
+        data: {
+          deletedAt: new Date(),
+        },
+      })
     })
 
     await createAuditLog({

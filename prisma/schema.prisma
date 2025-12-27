@@ -17,6 +17,19 @@ enum Role {
   VIEWER
 }
 
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+enum PostingDirection {
+  DR
+  CR
+}
+
 model Account {
   id                String  @id @default(cuid())
   userId            String
@@ -71,14 +84,19 @@ model VerificationToken {
 }
 
 model Organization {
-  id          String       @id @default(cuid())
-  name        String
-  slug        String       @unique
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-  memberships Membership[]
-  expenses    Expense[]
-  auditLogs   AuditLog[]
+  id                String              @id @default(cuid())
+  name              String
+  slug              String              @unique
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  memberships       Membership[]
+  expenses          Expense[]
+  auditLogs         AuditLog[]
+  accounts          LedgerAccount[]
+  ledgerTransactions LedgerTransaction[]
+  ledgerPeriodLocks LedgerPeriodLock[]
+  ledgerPostings    LedgerPosting[]
+  ledgerAttachmentLinks LedgerAttachmentLink[]
 
   @@index([slug])
 }
@@ -100,24 +118,29 @@ model Membership {
 }
 
 model Expense {
-  id             String       @id @default(cuid())
-  organizationId String
-  amount         Decimal      @db.Decimal(10, 2)
-  description    String
-  category       String?
-  vendor         String?
-  date           DateTime     @default(now())
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  createdById    String?
+  id                  String             @id @default(cuid())
+  organizationId      String
+  amount              Decimal            @db.Decimal(10, 2)
+  description         String
+  category            String?
+  vendor              String?
+  date                DateTime           @default(now())
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  createdById         String?
+  ledgerTransactionId String?            @unique
+  deletedAt           DateTime?
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  receipts     Receipt[]
+  organization         Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  receipts             Receipt[]
+  ledgerTransaction    LedgerTransaction?   @relation(fields: [ledgerTransactionId], references: [id], onDelete: SetNull)
 
   @@index([organizationId])
   @@index([date])
   @@index([category])
   @@index([vendor])
+  @@index([ledgerTransactionId])
+  @@index([deletedAt])
 }
 
 model Receipt {
@@ -130,7 +153,8 @@ model Receipt {
   mimeType   String
   createdAt  DateTime @default(now())
 
-  expense Expense @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  expense            Expense                @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  ledgerAttachmentLinks LedgerAttachmentLink[]
 
   @@index([expenseId])
 }
@@ -151,5 +175,97 @@ model AuditLog {
   @@index([userId])
   @@index([createdAt])
   @@index([entityType, entityId])
+}
+
+model LedgerAccount {
+  id         String            @id @default(cuid())
+  organizationId String
+  name       String
+  type       AccountType
+  currency   String            @default("USD")
+  code       String?
+  isSystem   Boolean           @default(false)
+  archivedAt DateTime?
+
+  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  postings           LedgerPosting[]
+
+  @@unique([organizationId, name])
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([organizationId, type])
+}
+
+model LedgerTransaction {
+  id             String              @id @default(cuid())
+  organizationId String
+  occurredAt      DateTime
+  description    String
+  vendor         String?
+  externalRef    String?
+  idempotencyKey String
+  createdByUserId String
+  createdAt       DateTime            @default(now())
+  originalTransactionId String?       @unique // For reversals
+  reversedByTransactionId String?      @unique // Points to reversal transaction
+
+  organization         Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  postings             LedgerPosting[]
+  expense              Expense?
+  attachmentLinks      LedgerAttachmentLink[]
+  originalTransaction  LedgerTransaction?   @relation("TransactionReversal", fields: [originalTransactionId], references: [id], onDelete: SetNull)
+  reversedBy           LedgerTransaction?   @relation("TransactionReversal")
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, occurredAt])
+  @@index([organizationId])
+  @@index([originalTransactionId])
+}
+
+model LedgerPosting {
+  id            String            @id @default(cuid())
+  organizationId String
+  transactionId String
+  accountId     String
+  direction     PostingDirection
+  amountCents   Int
+  currency      String            @default("USD")
+  memo          String?
+  category      String?
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  transaction  LedgerTransaction   @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  account       LedgerAccount      @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, accountId])
+  @@index([organizationId, transactionId])
+  @@index([organizationId])
+}
+
+model LedgerAttachmentLink {
+  id            String            @id @default(cuid())
+  organizationId String
+  transactionId String
+  receiptId     String
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  transaction  LedgerTransaction   @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  receipt      Receipt             @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, transactionId, receiptId])
+  @@index([organizationId])
+}
+
+model LedgerPeriodLock {
+  id            String            @id @default(cuid())
+  organizationId String
+  period        String            // YYYY-MM format
+  lockedAt      DateTime          @default(now())
+  lockedByUserId String
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, period])
+  @@index([organizationId])
 }
 

@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma"
 import { requireMembership, canManageExpenses } from "@/lib/auth-helpers"
 import { expenseSchema } from "@/lib/validations"
 import { createAuditLog } from "@/lib/audit-log"
+import { ensureDefaultAccounts, createExpenseTransaction, guardPeriodNotLocked } from "@/lib/ledger/ledgerService"
+import { randomUUID } from "crypto"
 
 export async function GET(request: NextRequest) {
   try {
@@ -18,6 +20,7 @@ export async function GET(request: NextRequest) {
     const expenses = await prisma.expense.findMany({
       where: {
         organizationId,
+        deletedAt: null, // Exclude soft-deleted expenses
       },
       include: {
         receipts: true,
@@ -44,14 +47,42 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 })
     }
 
-    const expense = await prisma.expense.create({
-      data: {
-        ...validated,
-        createdById: user.id,
-      },
-      include: {
-        receipts: true,
-      },
+    // Guard against locked periods
+    await guardPeriodNotLocked(validated.organizationId, validated.date)
+
+    // Convert amount to cents
+    const amountCents = Math.round(Number(validated.amount) * 100)
+
+    // Generate idempotency key
+    const idempotencyKey = `expense:${randomUUID()}`
+
+    // Create expense and ledger transaction in a single transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // Create ledger transaction (pass tx to use same transaction)
+      const ledgerTransactionId = await createExpenseTransaction({
+        organizationId: validated.organizationId,
+        occurredAt: validated.date,
+        description: validated.description,
+        amountCents,
+        category: validated.category,
+        vendor: validated.vendor,
+        idempotencyKey,
+        createdByUserId: user.id,
+      }, tx)
+
+      // Create expense record
+      const expense = await tx.expense.create({
+        data: {
+          ...validated,
+          createdById: user.id,
+          ledgerTransactionId,
+        },
+        include: {
+          receipts: true,
+        },
+      })
+
+      return expense
     })
 
     await createAuditLog({
@@ -59,11 +90,11 @@ export async function POST(request: NextRequest) {
       userId: user.id,
       action: "CREATE",
       entityType: "Expense",
-      entityId: expense.id,
-      metadata: { amount: expense.amount, description: expense.description },
+      entityId: result.id,
+      metadata: { amount: result.amount, description: result.description },
     })
 
-    return NextResponse.json(expense, { status: 201 })
+    return NextResponse.json(result, { status: 201 })
   } catch (error: any) {
     if (error.name === "ZodError") {
       return NextResponse.json({ error: "Validation error", details: error.errors }, { status: 400 })
