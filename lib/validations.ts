@@ -1,14 +1,20 @@
 import { z } from "zod"
 
+// Base expense schema (without organizationId - comes from OrgCore)
 export const expenseSchema = z.object({
   amount: z.coerce.number().positive("Amount must be positive"),
   description: z.string().min(1, "Description is required").max(500),
   category: z.string().max(100).optional(),
   vendor: z.string().max(100).optional(),
   date: z.coerce.date(),
+})
+
+// Extended schema for internal use (with organizationId)
+export const expenseSchemaWithOrg = expenseSchema.extend({
   organizationId: z.string().cuid(),
 })
 
+// Update schema (without organizationId - comes from OrgCore)
 export const expenseUpdateSchema = expenseSchema.partial().extend({
   id: z.string().cuid(),
 })

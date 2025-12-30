@@ -12,7 +12,8 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:studio": "prisma studio",
     "db:backfill-ledger": "tsx prisma/scripts/backfill-ledger.ts",
-    "test:ledger": "tsx scripts/ledger-selftest.ts"
+    "test:ledger": "tsx scripts/ledger-selftest.ts",
+    "test:orgcore": "tsx scripts/orgcore-selftest.ts"
   },
   "dependencies": {
     "@next-auth/prisma-adapter": "^1.0.7",

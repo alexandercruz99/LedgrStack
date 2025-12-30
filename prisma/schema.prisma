@@ -66,6 +66,7 @@ model User {
   email         String    @unique
   emailVerified DateTime?
   image         String?
+  activeOrgId   String?
   accounts      Account[]
   sessions      Session[]
   memberships   Membership[]
@@ -73,6 +74,7 @@ model User {
   updatedAt     DateTime  @updatedAt
 
   @@index([email])
+  @@index([activeOrgId])
 }
 
 model VerificationToken {

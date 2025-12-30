@@ -227,13 +227,79 @@ This script:
 - Links receipts to ledger transactions
 - Uses deterministic idempotency keys (`backfill:expense:${expenseId}`) so it's safe to rerun
 
+## OrgCore Module
+
+Ledgr uses an internal **OrgCore** module (`/src/core/org/`) to centralize organization and membership management. This ensures all features are organization-safe by default.
+
+### Key Features
+
+- **Active Organization:** Each user has an active organization that is automatically selected and persisted
+- **Actor Pattern:** All server operations use an `Actor` (userId + orgId + role) resolved from session
+- **Never Trust Client:** Organization ID is never accepted from client requests; always derived from active org
+- **Scoped Queries:** Helper functions ensure all database queries include `organizationId` in WHERE clauses
+- **Role Hierarchy:** OWNER > ADMIN > MEMBER > VIEWER with helper functions for role comparisons
+
+### Data Model
+
+- **User.activeOrgId:** Stores the user's currently active organization (nullable, auto-selected if missing)
+- **Organization:** Multi-tenant organizations
+- **Membership:** Links users to organizations with roles (unique per user+org)
+
+### Active Organization Resolution
+
+1. User logs in and session is established
+2. `requireActor()` is called in any server route
+3. OrgCore resolves:
+   - User ID from session
+   - Active org ID from `User.activeOrgId` (or first org if not set)
+   - Role from Membership table
+4. Returns `Actor` with all three values
+
+### Switching Organizations
+
+To switch active organization, call:
+
+```bash
+POST /api/org/switch
+Body: { "orgId": "org-id-here" }
+```
+
+This endpoint:
+- Verifies the user is a member of the requested organization
+- Updates `User.activeOrgId`
+- Returns success
+
+**Security Note:** The `orgId` in the request body is validated against the user's memberships. Users can only switch to organizations they belong to.
+
+### Using OrgCore in Features
+
+```typescript
+import { requireActor, orgFindManyExpense, writeAudit } from "@/src/core/org"
+
+// In any route handler:
+const actor = await requireActor("MEMBER") // Requires minimum MEMBER role
+
+// Use scoped queries:
+const expenses = await orgFindManyExpense(actor.orgId, {
+  where: { deletedAt: null },
+})
+
+// Write audit logs:
+await writeAudit({
+  actor,
+  action: "CREATE",
+  entityType: "Expense",
+  entityId: expense.id,
+})
+```
+
 ## Security Features
 
 - **Organization Isolation:** All queries are scoped by `organizationId` to prevent cross-tenant data access
 - **Role-Based Access Control:** OWNER, ADMIN, MEMBER, VIEWER roles with appropriate permissions
 - **Input Validation:** All API inputs validated with Zod schemas
 - **Authorization Checks:** Server-side authorization on all routes
-- **IDOR Prevention:** Requests always include organizationId and membership is verified
+- **IDOR Prevention:** Organization ID is never trusted from client; always derived from active org via OrgCore
 - **Period Locking:** Prevents modifications to locked accounting periods
 
 ## Contributing

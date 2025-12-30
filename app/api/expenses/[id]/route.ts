@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from "next/server"
 import { prisma } from "@/lib/prisma"
-import { requireMembership, canManageExpenses } from "@/lib/auth-helpers"
 import { expenseUpdateSchema } from "@/lib/validations"
-import { createAuditLog } from "@/lib/audit-log"
-import { ensureDefaultAccounts, createExpenseTransaction, reverseTransaction, guardPeriodNotLocked } from "@/lib/ledger/ledgerService"
+import { createExpenseTransaction, reverseTransaction, guardPeriodNotLocked } from "@/lib/ledger/ledgerService"
+import { requireActor, orgFindUniqueExpense, writeAudit } from "@/src/core/org"
 import { randomUUID } from "crypto"
 
 export async function GET(
@@ -12,7 +11,10 @@ export async function GET(
 ) {
   try {
     const { id } = await params
-    const expense = await prisma.expense.findUnique({
+    const actor = await requireActor("VIEWER")
+
+    // Use scoped query helper
+    const expense = await orgFindUniqueExpense(actor.orgId, {
       where: { id },
       include: {
         receipts: true,
@@ -23,11 +25,10 @@ export async function GET(
       return NextResponse.json({ error: "Expense not found" }, { status: 404 })
     }
 
-    await requireMembership(expense.organizationId, "VIEWER")
-
     return NextResponse.json(expense)
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 401 })
+    const statusCode = (error as any).statusCode || 500
+    return NextResponse.json({ error: error.message }, { status: statusCode })
   }
 }
 
@@ -37,10 +38,13 @@ export async function PATCH(
 ) {
   try {
     const { id } = await params
+    const actor = await requireActor("MEMBER")
+
     const body = await request.json()
     const validated = expenseUpdateSchema.parse({ ...body, id })
 
-    const existingExpense = await prisma.expense.findUnique({
+    // Use scoped query helper
+    const existingExpense = await orgFindUniqueExpense(actor.orgId, {
       where: { id },
     })
 
@@ -48,19 +52,12 @@ export async function PATCH(
       return NextResponse.json({ error: "Expense not found" }, { status: 404 })
     }
 
-    const { user } = await requireMembership(existingExpense.organizationId, "MEMBER")
-
-    if (!(await canManageExpenses(existingExpense.organizationId, user.id))) {
-      return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 })
-    }
-
-    // Prevent changing organizationId
-    const { organizationId, id: _id, ...updateData } = validated
-
     // Guard against locked periods (check both old and new dates)
-    await guardPeriodNotLocked(existingExpense.organizationId, existingExpense.date)
+    await guardPeriodNotLocked(actor.orgId, existingExpense.date)
+    // Remove id from validated data (id comes from params, organizationId from actor)
+    const { id: _id, ...updateData } = validated
     if (updateData.date) {
-      await guardPeriodNotLocked(existingExpense.organizationId, updateData.date)
+      await guardPeriodNotLocked(actor.orgId, updateData.date)
     }
 
     // Implement supersede: reverse old transaction, create new one
@@ -68,10 +65,10 @@ export async function PATCH(
       // Reverse existing ledger transaction if it exists
       if (existingExpense.ledgerTransactionId) {
         await reverseTransaction({
-          organizationId: existingExpense.organizationId,
+          organizationId: actor.orgId,
           transactionId: existingExpense.ledgerTransactionId,
           reason: "Expense updated",
-          createdByUserId: user.id,
+          createdByUserId: actor.userId,
         }, tx)
       }
 
@@ -86,21 +83,23 @@ export async function PATCH(
       const idempotencyKey = `expense:${id}:${randomUUID()}`
 
       const newLedgerTransactionId = await createExpenseTransaction({
-        organizationId: existingExpense.organizationId,
+        organizationId: actor.orgId,
         occurredAt: finalDate,
         description: finalDescription,
         amountCents,
         category: finalCategory,
         vendor: finalVendor,
         idempotencyKey,
-        createdByUserId: user.id,
+        createdByUserId: actor.userId,
       }, tx)
 
       // Update expense with new values and new ledger transaction ID
+      // updateData already has organizationId and id removed
+      const safeUpdateData = updateData
       const expense = await tx.expense.update({
         where: { id },
         data: {
-          ...updateData,
+          ...safeUpdateData,
           ledgerTransactionId: newLedgerTransactionId,
         },
         include: {
@@ -111,9 +110,8 @@ export async function PATCH(
       return expense
     })
 
-    await createAuditLog({
-      organizationId: existingExpense.organizationId,
-      userId: user.id,
+    await writeAudit({
+      actor,
       action: "UPDATE",
       entityType: "Expense",
       entityId: result.id,
@@ -125,7 +123,8 @@ export async function PATCH(
     if (error.name === "ZodError") {
       return NextResponse.json({ error: "Validation error", details: error.errors }, { status: 400 })
     }
-    return NextResponse.json({ error: error.message }, { status: 401 })
+    const statusCode = (error as any).statusCode || 500
+    return NextResponse.json({ error: error.message }, { status: statusCode })
   }
 }
 
@@ -135,7 +134,10 @@ export async function DELETE(
 ) {
   try {
     const { id } = await params
-    const expense = await prisma.expense.findUnique({
+    const actor = await requireActor("MEMBER")
+
+    // Use scoped query helper
+    const expense = await orgFindUniqueExpense(actor.orgId, {
       where: { id },
     })
 
@@ -143,25 +145,19 @@ export async function DELETE(
       return NextResponse.json({ error: "Expense not found" }, { status: 404 })
     }
 
-    const { user } = await requireMembership(expense.organizationId, "MEMBER")
-
-    if (!(await canManageExpenses(expense.organizationId, user.id))) {
-      return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 })
-    }
-
     // Guard against locked periods
-    await guardPeriodNotLocked(expense.organizationId, expense.date)
+    await guardPeriodNotLocked(actor.orgId, expense.date)
 
     // Soft delete: reverse transaction, set deletedAt, keep receipts
     await prisma.$transaction(async (tx) => {
       // Reverse ledger transaction if it exists
       if (expense.ledgerTransactionId) {
         await reverseTransaction({
-          organizationId: expense.organizationId,
+          organizationId: actor.orgId,
           transactionId: expense.ledgerTransactionId,
           reason: "Expense deleted",
-          createdByUserId: user.id,
-        })
+          createdByUserId: actor.userId,
+        }, tx)
       }
 
       // Soft delete expense
@@ -173,9 +169,8 @@ export async function DELETE(
       })
     })
 
-    await createAuditLog({
-      organizationId: expense.organizationId,
-      userId: user.id,
+    await writeAudit({
+      actor,
       action: "DELETE",
       entityType: "Expense",
       entityId: id,
@@ -184,7 +179,8 @@ export async function DELETE(
 
     return NextResponse.json({ success: true })
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 401 })
+    const statusCode = (error as any).statusCode || 500
+    return NextResponse.json({ error: error.message }, { status: statusCode })
   }
 }
 

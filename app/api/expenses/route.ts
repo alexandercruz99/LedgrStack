@@ -1,25 +1,18 @@
 import { NextRequest, NextResponse } from "next/server"
 import { prisma } from "@/lib/prisma"
-import { requireMembership, canManageExpenses } from "@/lib/auth-helpers"
 import { expenseSchema } from "@/lib/validations"
-import { createAuditLog } from "@/lib/audit-log"
 import { ensureDefaultAccounts, createExpenseTransaction, guardPeriodNotLocked } from "@/lib/ledger/ledgerService"
+import { requireActor, orgFindManyExpense, writeAudit } from "@/src/core/org"
 import { randomUUID } from "crypto"
 
 export async function GET(request: NextRequest) {
   try {
-    const searchParams = request.nextUrl.searchParams
-    const organizationId = searchParams.get("organizationId")
+    // Use OrgCore to get actor (user + active org + role)
+    const actor = await requireActor("VIEWER")
 
-    if (!organizationId) {
-      return NextResponse.json({ error: "organizationId is required" }, { status: 400 })
-    }
-
-    const { user } = await requireMembership(organizationId, "VIEWER")
-
-    const expenses = await prisma.expense.findMany({
+    // Use scoped query helper
+    const expenses = await orgFindManyExpense(actor.orgId, {
       where: {
-        organizationId,
         deletedAt: null, // Exclude soft-deleted expenses
       },
       include: {
@@ -32,23 +25,28 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(expenses)
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 401 })
+    const statusCode = (error as any).statusCode || 500
+    return NextResponse.json({ error: error.message }, { status: statusCode })
   }
 }
 
 export async function POST(request: NextRequest) {
   try {
+    // Use OrgCore to get actor (user + active org + role)
+    const actor = await requireActor("MEMBER")
+
     const body = await request.json()
-    const validated = expenseSchema.parse(body)
-
-    const { user, membership } = await requireMembership(validated.organizationId, "MEMBER")
-
-    if (!(await canManageExpenses(validated.organizationId, user.id))) {
-      return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 })
+    // Validate expense data (organizationId comes from actor, not client)
+    const expenseData = expenseSchema.parse(body)
+    
+    // Add organizationId from actor
+    const validated = {
+      ...expenseData,
+      organizationId: actor.orgId, // Use actor's orgId, never trust client
     }
 
     // Guard against locked periods
-    await guardPeriodNotLocked(validated.organizationId, validated.date)
+    await guardPeriodNotLocked(actor.orgId, validated.date)
 
     // Convert amount to cents
     const amountCents = Math.round(Number(validated.amount) * 100)
@@ -60,21 +58,21 @@ export async function POST(request: NextRequest) {
     const result = await prisma.$transaction(async (tx) => {
       // Create ledger transaction (pass tx to use same transaction)
       const ledgerTransactionId = await createExpenseTransaction({
-        organizationId: validated.organizationId,
+        organizationId: actor.orgId,
         occurredAt: validated.date,
         description: validated.description,
         amountCents,
         category: validated.category,
         vendor: validated.vendor,
         idempotencyKey,
-        createdByUserId: user.id,
+        createdByUserId: actor.userId,
       }, tx)
 
       // Create expense record
       const expense = await tx.expense.create({
         data: {
           ...validated,
-          createdById: user.id,
+          createdById: actor.userId,
           ledgerTransactionId,
         },
         include: {
@@ -85,9 +83,9 @@ export async function POST(request: NextRequest) {
       return expense
     })
 
-    await createAuditLog({
-      organizationId: validated.organizationId,
-      userId: user.id,
+    // Use OrgCore audit helper
+    await writeAudit({
+      actor,
       action: "CREATE",
       entityType: "Expense",
       entityId: result.id,
@@ -99,7 +97,8 @@ export async function POST(request: NextRequest) {
     if (error.name === "ZodError") {
       return NextResponse.json({ error: "Validation error", details: error.errors }, { status: 400 })
     }
-    return NextResponse.json({ error: error.message }, { status: 401 })
+    const statusCode = (error as any).statusCode || 500
+    return NextResponse.json({ error: error.message }, { status: statusCode })
   }
 }
 
